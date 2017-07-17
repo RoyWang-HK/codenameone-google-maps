@@ -14,11 +14,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.codename1.googlemaps;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+
 import com.codename1.components.WebBrowser;
-import com.codename1.io.Log;
+import com.codename1.googlemaps.MapContainer.LayerAdaptor.LayerWithZoomLevels;
 import com.codename1.io.Util;
 import com.codename1.javascript.JSFunction;
 import com.codename1.javascript.JSObject;
@@ -29,35 +33,40 @@ import com.codename1.maps.BoundingBox;
 import com.codename1.maps.Coord;
 import com.codename1.maps.MapComponent;
 import com.codename1.maps.MapListener;
+import com.codename1.maps.Mercator;
+import com.codename1.maps.Projection;
+import com.codename1.maps.Tile;
+import com.codename1.maps.layers.Layer;
 import com.codename1.maps.layers.LinesLayer;
 import com.codename1.maps.layers.PointLayer;
 import com.codename1.maps.layers.PointsLayer;
-import com.codename1.ui.Container;
 import com.codename1.maps.providers.MapProvider;
 import com.codename1.maps.providers.OpenStreetMapProvider;
 import com.codename1.system.NativeLookup;
 import com.codename1.ui.BrowserComponent;
+import com.codename1.ui.Component;
+import com.codename1.ui.Container;
 import com.codename1.ui.Display;
 import com.codename1.ui.EncodedImage;
+import com.codename1.ui.Graphics;
 import com.codename1.ui.PeerComponent;
 import com.codename1.ui.events.ActionEvent;
 import com.codename1.ui.events.ActionListener;
+import com.codename1.ui.geom.Dimension;
 import com.codename1.ui.geom.Point;
-import com.codename1.ui.layouts.BorderLayout;
+import com.codename1.ui.layouts.LayeredLayout;
+import com.codename1.ui.plaf.Style;
 import com.codename1.ui.util.EventDispatcher;
 import com.codename1.util.StringUtil;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
 
 /**
- * An abstract Map API that encapsulates the device native map and seamlessly replaces
- * it with MapComponent when unsupported by the platform.
+ * An abstract Map API that encapsulates the device native map and seamlessly
+ * replaces it with MapComponent when unsupported by the platform.
  *
  * @author Shai Almog
  */
 public class MapContainer extends Container {
+
     /**
      * Map type for native maps
      */
@@ -72,31 +81,39 @@ public class MapContainer extends Container {
      * Map type for native maps
      */
     public static final int MAP_TYPE_NONE = 3;
-    
+
+    //The map to display is either an {@code InternalNativeMaps}, {@code MapComponent} 
+    //or an {@code BrowserComponent}
     private InternalNativeMaps internalNative;
     private MapComponent internalLightweightCmp;
     private BrowserComponent internalBrowser;
-    private  JavascriptContext browserContext;
+    private JavascriptContext browserContext;
     private ArrayList<MapListener> listeners;
     private PointsLayer points;
-    
+
     private ArrayList<MapObject> markers = new ArrayList<MapObject>();
-    private static HashMap<Integer, MapContainer> instances = new HashMap<Integer, MapContainer>();
+    private static HashMap<Integer, MapContainer> instances = new HashMap<Integer, MapContainer>(); //Instance ID should be constant, so do not use arraylist 
     private static int currentMapId;
     private int mapId;
     private boolean showMyLocation;
     private boolean rotateGestureEnabled;
-    
+
     private EventDispatcher tapListener;
     private EventDispatcher longPressListener;
-    
+
     /**
-     * Default constructor creates an instance with the standard OpenStreetMap version if necessary
+     * Hold the layers
+     */
+    private LayerAdaptor layerAdaptor;
+
+    /**
+     * Default constructor creates an instance with the standard OpenStreetMap
+     * version if necessary
      */
     public MapContainer() {
         this(new OpenStreetMapProvider());
     }
-    
+
     /**
      * @inheritDoc
      */
@@ -104,94 +121,98 @@ public class MapContainer extends Container {
     protected void initComponent() {
         instances.put(mapId, this);
         super.initComponent();
-        if(isNativeMaps()) {
+        if (isNativeMaps()) {
             internalNative.initialize();
             getComponentAt(0).setVisible(true);
         }
     }
-    
+
     /**
      * @inheritDoc
      */
     @Override
     protected void deinitialize() {
         instances.remove(mapId);
-        if(internalNative != null) {
+        if (internalNative != null) {
             internalNative.deinitialize();
         }
         super.deinitialize();
-        
+
     }
-    
+
     /**
      * Uses the given provider in case of a fallback
-     * 
+     *
      * @param provider the map provider
      */
     public MapContainer(MapProvider provider) {
         this(provider, null);
     }
-    
+
     /**
-     * Uses HTML JavaScript google maps on fallback platforms instead of the tiled map
+     * Uses HTML JavaScript google maps on fallback platforms instead of the
+     * tiled map
+     *
      * @param javaScriptMapsAPIKey the API key for HTML maps
      */
     public MapContainer(String javaScriptMapsAPIKey) {
         this(null, javaScriptMapsAPIKey);
     }
-    
+
     /**
      * Uses the given provider in case of a fallback
-     * 
+     *
      * @param provider the map provider
      */
     private MapContainer(MapProvider provider, final String htmlApiKey) {
-        super(new BorderLayout());
+        //super(new BorderLayout());
+        super(new LayeredLayout());
+        super.setScrollableX(false);
+        super.setScrollableY(false);
         if (provider == null && "win".equals(Display.getInstance().getPlatformName())) {
-            
+
             // Right now UWP gives an NPE when we use the internal browser
             // so disabling it for now.
             provider = new OpenStreetMapProvider();
         }
-        internalNative = (InternalNativeMaps)NativeLookup.create(InternalNativeMaps.class);
-        if(internalNative != null) {
-            if(internalNative.isSupported()) {
+        internalNative = (InternalNativeMaps) NativeLookup.create(InternalNativeMaps.class);
+        if (internalNative != null) {
+            if (internalNative.isSupported()) {
                 currentMapId++;
                 mapId = currentMapId;
                 PeerComponent p = internalNative.createNativeMap(mapId);
-                
+
                 // can happen if Google play services failed or aren't installed on an Android device
-                if(p != null) {
+                if (p != null) {
                     //System.out.println("Adding native map "+p);
-                    
-                    addComponent(BorderLayout.CENTER, p);
+                   super.addComponent(p);
                     return;
                 } else {
                     //System.out.println("Failed to add native map");
                 }
-            } 
+            }
             internalNative = null;
         }
-        if(provider != null) {
+        if (provider != null) {
             internalLightweightCmp = new MapComponent(provider) {
                 private boolean drg = false;
 
                 @Override
                 public void pointerDragged(int x, int y) {
-                    super.pointerDragged(x, y); 
+                    super.pointerDragged(x, y);
                     drg = true;
                 }
 
                 @Override
                 public void pointerDragged(int[] x, int[] y) {
-                    super.pointerDragged(x, y); 
+                    super.pointerDragged(x, y);
                     drg = true;
                 }
 
                 @Override
                 public void pointerReleased(int x, int y) {
-                    super.pointerReleased(x, y); 
-                    if(!drg) {
+                    super.pointerReleased(x, y);
+                    if (!drg) {
                         fireTapEvent(x, y);
                     }
                     drg = false;
@@ -199,38 +220,59 @@ public class MapContainer extends Container {
 
                 @Override
                 public void longPointerPress(int x, int y) {
-                    super.longPointerPress(x, y); 
+                    super.longPointerPress(x, y);
                     fireLongPressEvent(x, y);
                 }
             };
-            addComponent(BorderLayout.CENTER, internalLightweightCmp);
+            super.addComponent(internalLightweightCmp);
         } else {
             internalBrowser = new BrowserComponent();
-            internalBrowser.getAllStyles().setPadding(0,0,0,0);
-            internalBrowser.getAllStyles().setMargin(0,0,0,0);
+            Style s = null;
+            //TODO For some reason Netbeans does not allow updating the version
+            internalBrowser.getDisabledStyle().setPadding(0, 0, 0, 0);
+            internalBrowser.getSelectedStyle().setPadding(0, 0, 0, 0);
+            internalBrowser.getDisabledStyle().setPadding(0, 0, 0, 0);
+            internalBrowser.getPressedStyle().setPadding(0, 0, 0, 0);
+            internalBrowser.getDisabledStyle().setMargin(0, 0, 0, 0);
+            internalBrowser.getSelectedStyle().setMargin(0, 0, 0, 0);
+            internalBrowser.getDisabledStyle().setMargin(0, 0, 0, 0);
+            internalBrowser.getPressedStyle().setMargin(0, 0, 0, 0);
+            //internalBrowser.getAllStyles().setPadding(0, 0, 0, 0);
+            //internalBrowser.getAllStyles().setMargin(0, 0, 0, 0);
 
             initBrowserComponent(htmlApiKey);
-            
-            addComponent(BorderLayout.CENTER, internalBrowser);
+
+            super.addComponent(internalBrowser);
         }
         setRotateGestureEnabled(true);
+        //Layers
+        layerAdaptor = new LayerAdaptor(this);
+        super.addComponent(layerAdaptor.layersDraw);
+    }
+
+    @Override
+    public void addComponent(Component p) {
+        //throw new UnsupportedOperationException("Cannot add directly to the MapContainer!");
+        //TODO
+        throw new RuntimeException();
     }
 
     private BrowserBridge browserBridge = new BrowserBridge();
-    
+
     private class BrowserBridge {
+
         List<Runnable> onReady = new ArrayList<Runnable>();
         private JSObject bridge;
-        
+
         BrowserBridge() {
-            
+
         }
-        
+
         private void ready(Runnable r) {
             if (bridge != null) {
                 if (!onReady.isEmpty()) {
                     List<Runnable> tmp = new ArrayList<Runnable>();
-                    synchronized(onReady) {
+                    synchronized (onReady) {
                         tmp.addAll(onReady);
                         onReady.clear();
                     }
@@ -245,12 +287,12 @@ public class MapContainer extends Container {
                 if (r == null) {
                     return;
                 }
-                synchronized(onReady) {
+                synchronized (onReady) {
                     onReady.add(r);
                 }
             }
         }
-        
+
         private void waitForReady() {
             int ctr = 0;
             while (bridge == null) {
@@ -262,17 +304,18 @@ public class MapContainer extends Container {
                     public void run() {
                         try {
                             Thread.sleep(20);
-                        } catch (Exception ex){}
+                        } catch (Exception ex) {
+                        }
                     }
-                    
+
                 });
             }
-            
+
         }
     }
-    
+
     private void initBrowserComponent(String htmlApiKey) {
-        
+
         //System.out.println("About to check location");
         Location loc = LocationManager.getLocationManager().getLastKnownLocation();
         try {
@@ -282,49 +325,54 @@ public class MapContainer extends Container {
             //System.out.println("Map text: "+str);
             str = StringUtil.replaceAll(str, "YOUR_API_KEY", htmlApiKey);
             //System.out.println("Finished setting API key");
-            str = StringUtil.replaceAll(str, "//origin = MAPCONTAINER_ORIGIN", "origin = {lat: "+ loc.getLatitude() + ", lng: "  + loc.getLongitude() + "};");
+            str = StringUtil.replaceAll(str, "//origin = MAPCONTAINER_ORIGIN", "origin = {lat: " + loc.getLatitude() + ", lng: " + loc.getLongitude() + "};");
             //System.out.println("Finished setting origin");
             internalBrowser.setPage(str, "/");
             internalBrowser.addWebEventListener("onLoad", new ActionListener() {
 
+                @Override
                 public void actionPerformed(ActionEvent evt) {
                     JavascriptContext ctx = new JavascriptContext(internalBrowser);
-                    JSObject jsProxy = (JSObject)ctx.get("{}");
+                    JSObject jsProxy = (JSObject) ctx.get("{}");
                     jsProxy.set("fireTapEvent", new JSFunction() {
 
+                        @Override
                         public void apply(JSObject self, Object[] args) {
-                            fireTapEvent(((Double)args[0]).intValue() + internalBrowser.getAbsoluteX(), ((Double)args[1]).intValue() + internalBrowser.getAbsoluteY());
+                            fireTapEvent(((Double) args[0]).intValue() + internalBrowser.getAbsoluteX(), ((Double) args[1]).intValue() + internalBrowser.getAbsoluteY());
                         }
                     });
                     jsProxy.set("fireLongPressEvent", new JSFunction() {
 
+                        @Override
                         public void apply(JSObject self, Object[] args) {
-                            fireLongPressEvent(((Double)args[0]).intValue() + internalBrowser.getAbsoluteX(), ((Double)args[1]).intValue() + internalBrowser.getAbsoluteY());
+                            fireLongPressEvent(((Double) args[0]).intValue() + internalBrowser.getAbsoluteX(), ((Double) args[1]).intValue() + internalBrowser.getAbsoluteY());
                         }
                     });
-                    
+
                     jsProxy.set("fireMapChangeEvent", new JSFunction() {
 
+                        @Override
                         public void apply(JSObject self, Object[] args) {
-                            int zoom = ((Double)args[0]).intValue();
-                            double lat = (Double)args[1];
-                            double lon = (Double)args[2];
+                            int zoom = ((Double) args[0]).intValue();
+                            double lat = (Double) args[1];
+                            double lon = (Double) args[2];
                             fireMapListenerEvent(zoom, lat, lon);
                         }
-                        
+
                     });
-                    
+
                     jsProxy.set("fireMarkerEvent", new JSFunction() {
+                        @Override
                         public void apply(JSObject self, Object[] args) {
-                            int key = ((Double)args[0]).intValue();
+                            int key = ((Double) args[0]).intValue();
                             fireMarkerEvent(key);
                         }
                     });
-                    
-                    JSObject window = (JSObject)ctx.get("window");
+
+                    JSObject window = (JSObject) ctx.get("window");
                     window.set("com_codename1_googlemaps_MapContainer", jsProxy);
                     //System.out.println("About to load bridge");
-                    browserBridge.bridge = (JSObject)window.get("com_codename1_googlemaps_MapContainer_bridge");
+                    browserBridge.bridge = (JSObject) window.get("com_codename1_googlemaps_MapContainer_bridge");
                     //if (browserBridge.bridge != null) {
                     //    System.out.println("BrowserBridge pointer at 307 is "+browserBridge.bridge.toJSPointer());
                     //}
@@ -332,31 +380,31 @@ public class MapContainer extends Container {
                     if (browserBridge.bridge == null) {
                         window.set("com_codename1_googlemaps_MapContainer_onReady", new JSFunction() {
 
+                            @Override
                             public void apply(JSObject self, Object[] args) {
                                 //System.out.println("Browser bridge in JS onReady callback");
-                                browserBridge.bridge = (JSObject)args[0];
+                                browserBridge.bridge = (JSObject) args[0];
                                 //System.out.println("Browser bridge pointer at 316 is "+browserBridge.bridge.toJSPointer());
                             }
 
                         });
                     }
-                
+
                     ///System.out.println("Bridge is ready");
                     browserBridge.ready(null);
                 }
             });
-            
-            
+
             return;
         } catch (IOException ex) {
             ex.printStackTrace();
         }
-        
+
     }
-    
+
     static void mapUpdated(int mapId) {
         final MapContainer mc = instances.get(mapId);
-        if(mc != null) {
+        if (mc != null) {
             Display.getInstance().callSerially(new Runnable() {
                 public void run() {
                     mc.repaint();
@@ -364,54 +412,61 @@ public class MapContainer extends Container {
             });
         }
     }
-    
+
     /**
      * Returns true if native maps are used
+     *
      * @return false if the lightweight maps are used
      */
     public boolean isNativeMaps() {
         return internalNative != null;
     }
-    
+
     static void fireMarkerEvent(int mapId, final long markerId) {
         final MapContainer mc = instances.get(mapId);
-        if(mc != null) {
-            if(!Display.getInstance().isEdt()) {
+        if (mc != null) {
+            if (Display.getInstance().isEdt()) {
+                mc.fireMarkerEvent(markerId);
+            } else {
                 Display.getInstance().callSerially(new Runnable() {
                     public void run() {
                         mc.fireMarkerEvent(markerId);
                     }
                 });
-                return;
             }
-            mc.fireMarkerEvent(markerId);
+            
         }
     }
-    
+
     void fireMarkerEvent(long markerId) {
-        for(MapObject m : markers) {
-            if(m.mapKey == markerId) {
-                if(m.callback != null) {
+        for (MapObject m : markers) {
+            if (m.mapKey == markerId) {
+                if (m.callback != null) {
                     m.callback.actionPerformed(new ActionEvent(m));
                 }
                 return;
             }
         }
     }
-    
+
     /**
      * Adds a marker to the map with the given attributes
-     * @param icon the icon, if the native maps are used this value can be null to use the default marker
+     *
+     * @param icon the icon, if the native maps are used this value can be null
+     * to use the default marker
      * @param location the coordinate for the marker
      * @param text the string associated with the location
      * @param longText longer description associated with the location
-     * @param onClick will be invoked when the user clicks the marker. Important: events are only sent when the native map is in initialized state
-     * @return marker reference object that should be used when removing the marker
+     * @param onClick will be invoked when the user clicks the marker.
+     * Important: events are only sent when the native map is in initialized
+     * state
+     * @return marker reference object that should be used when removing the
+     * marker
      */
     public MapObject addMarker(EncodedImage icon, Coord location, String text, String longText, final ActionListener onClick) {
-        if(internalNative != null) {
+        if (internalNative != null) {
             byte[] iconData = null;
-            if(icon != null) {
+            if (icon != null) {
                 iconData = icon.getImageData();
             }
             long key = internalNative.addMarker(iconData, location.getLatitude(), location.getLongitude(), text, longText, onClick != null);
@@ -421,18 +476,18 @@ public class MapContainer extends Container {
             markers.add(o);
             return o;
         } else {
-            if(internalLightweightCmp != null) {
+            if (internalLightweightCmp != null) {
                 PointLayer pl = new PointLayer(location, text, icon);
-                if(points == null) {
+                if (points == null) {
                     points = new PointsLayer();
                     internalLightweightCmp.addLayer(points);
                 }
                 points.addActionListener(new ActionListener() {
                     public void actionPerformed(ActionEvent evt) {
-                        PointLayer point = (PointLayer)evt.getSource();
-                        for(MapObject o : markers) {
-                            if(o.point == point) {
-                                if(o.callback != null) {
+                        PointLayer point = (PointLayer) evt.getSource();
+                        for (MapObject o : markers) {
+                            if (o.point == point) {
+                                if (o.callback != null) {
                                     o.callback.actionPerformed(new ActionEvent(o));
                                 }
                                 evt.consume();
@@ -448,15 +503,15 @@ public class MapContainer extends Container {
                 markers.add(o);
                 internalLightweightCmp.revalidate();
                 return o;
-                
+
             } else {
-                
+
                 String uri = null;
-                if(icon != null) {
+                if (icon != null) {
                     uri = WebBrowser.createDataURI(icon.getImageData(), "image/png");
-                } 
+                }
                 browserBridge.waitForReady();
-                long key = ((Double)browserBridge.bridge.call("addMarker", new Object[]{
+                long key = ((Double) browserBridge.bridge.call("addMarker", new Object[]{
                     uri,
                     location.getLatitude(),
                     location.getLongitude(),
@@ -464,27 +519,28 @@ public class MapContainer extends Container {
                     longText
                 })).intValue();
                 MapObject o = new MapObject();
-                
+
                 o.mapKey = key;
                 o.callback = onClick;
                 markers.add(o);
                 //System.out.println("MapKey added "+o.mapKey);
                 return o;
             }
-            
+
         }
-        
+
     }
-    
+
     /**
      * Draws a path on the map
+     *
      * @param path the path to draw on the map
      * @return a map object instance that allows us to remove the drawn path
      */
     public MapObject addPath(Coord... path) {
-        if(internalNative != null) {
+        if (internalNative != null) {
             long key = internalNative.beginPath();
-            for(Coord c : path) {
+            for (Coord c : path) {
                 internalNative.addToPath(key, c.getLatitude(), c.getLongitude());
             }
             key = internalNative.finishPath(key);
@@ -493,7 +549,7 @@ public class MapContainer extends Container {
             markers.add(o);
             return o;
         } else {
-            if(internalLightweightCmp != null) {
+            if (internalLightweightCmp != null) {
                 LinesLayer ll = new LinesLayer();
                 ll.addLineSegment(path);
 
@@ -507,7 +563,7 @@ public class MapContainer extends Container {
                 StringBuilder json = new StringBuilder();
                 json.append("[");
                 boolean first = true;
-                for(Coord c : path) {
+                for (Coord c : path) {
                     if (first) {
                         first = false;
                     } else {
@@ -516,9 +572,8 @@ public class MapContainer extends Container {
                     json.append("{\"lat\":").append(c.getLatitude()).append(", \"lon\": ").append(c.getLongitude()).append("}");
                 }
                 json.append("]");
-                long key = ((Double)browserBridge.bridge.call("addPathAsJSON", new Object[]{json.toString()})).intValue();
-                
-                
+                long key = ((Double) browserBridge.bridge.call("addPathAsJSON", new Object[]{json.toString()})).intValue();
+
                 MapObject o = new MapObject();
                 o.mapKey = key;
                 markers.add(o);
@@ -526,15 +581,15 @@ public class MapContainer extends Container {
             }
         }
     }
-    
+
     /**
      * Returns the max zoom level of the map
      *
      * @return max zoom level
      */
     public int getMaxZoom() {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
                 return internalLightweightCmp.getMaxZoomLevel();
             } else {
                 browserBridge.waitForReady();
@@ -543,15 +598,15 @@ public class MapContainer extends Container {
         }
         return internalNative.getMaxZoom();
     }
-    
+
     /**
      * Returns the min zoom level of the map
      *
      * @return min zoom level
      */
     public int getMinZoom() {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
                 return internalLightweightCmp.getMinZoomLevel();
             } else {
                 browserBridge.waitForReady();
@@ -560,112 +615,96 @@ public class MapContainer extends Container {
         }
         return internalNative.getMinZoom();
     }
-    
+
     /**
      * Removes the map object from the map
+     *
      * @param obj the map object to remove
      */
     public void removeMapObject(MapObject obj) {
         markers.remove(obj);
-        if(internalNative != null) {
+        if (internalNative != null) {
             internalNative.removeMapElement(obj.mapKey);
         } else {
-            if(obj.lines != null) {
-                if(internalLightweightCmp != null) {
+            if (obj.lines != null) {
+                if (internalLightweightCmp != null) {
                     internalLightweightCmp.removeLayer(obj.lines);
                 } else {
                     browserBridge.waitForReady();
                     browserBridge.bridge.call("removeMapElement", new Object[]{obj.mapKey});
-                    
+
                 }
             } else {
-                if(internalLightweightCmp != null) {
+                if (internalLightweightCmp != null) {
                     if (points != null) {
                         points.removePoint(obj.point);
                     }
                 } else {
                     browserBridge.waitForReady();
                     browserBridge.bridge.call("removeMapElement", new Object[]{obj.mapKey});
-                    
+
                 }
-                
-                
+
             }
         }
     }
-    
-    /**
-     * Removes all the layers from the map
-     */
-    public void clearMapLayers() {
-        if(internalNative != null) {
-            internalNative.removeAllMarkers();
-            markers.clear();
-        } else {
-            if(internalLightweightCmp != null) {
-                internalLightweightCmp.removeAllLayers();
-                points = null;
-            } else {
-                browserBridge.waitForReady();
-                browserBridge.bridge.call("removeAllMarkers");
-                markers.clear();
-            }
-        }
-    }
-    
+
     /**
      * Zoom to the given coordinate on the map
+     *
      * @param crd the coordinate
      * @param zoom the zoom level
      */
     public void zoom(Coord crd, int zoom) {
-        if(internalNative != null) {
+        if (internalNative != null) {
             internalNative.setZoom(crd.getLatitude(), crd.getLongitude(), zoom);
         } else {
-            if(internalLightweightCmp != null) {
+            if (internalLightweightCmp != null) {
                 internalLightweightCmp.zoomTo(crd, zoom);
             } else {
                 browserBridge.waitForReady();
-                browserBridge.bridge.call("zoom", new Object[]{ crd.getLatitude(), crd.getLongitude(), zoom});
-                
+                browserBridge.bridge.call("zoom", new Object[]{crd.getLatitude(), crd.getLongitude(), zoom});
+
             }
         }
     }
-    
+
     /**
      * Returns the current zoom level
+     *
      * @return the current zoom level between min/max zoom
      */
     public float getZoom() {
-        if(internalNative != null) {
+        if (internalNative != null) {
             return internalNative.getZoom();
         } else {
-            if(internalLightweightCmp != null) {
+            if (internalLightweightCmp != null) {
                 return internalLightweightCmp.getZoomLevel();
             }
             browserBridge.waitForReady();
             return browserBridge.bridge.callInt("getZoom");
-            
-        }        
+
+        }
     }
 
     public BoundingBox getBoundingBox() {
         Coord sw = this.getCoordAtPosition(0, getHeight());
         Coord ne = this.getCoordAtPosition(getWidth(), 0);
         return new BoundingBox(sw, ne);
-        
+
     }
-    
+
     /**
      * Sets the native map type to one of the MAP_TYPE constants
+     *
      * @param type one of the MAP_TYPE constants
      */
     public void setMapType(int type) {
-        if(internalNative != null) {
+        if (internalNative != null) {
             internalNative.setMapType(type);
         } else {
             if (internalLightweightCmp != null) {
-                
+
             } else {
                 // browser component
                 browserBridge.waitForReady();
@@ -673,35 +712,35 @@ public class MapContainer extends Container {
             }
         }
     }
-    
+
     /**
      * Returns the native map type
+     *
      * @return one of the MAP_TYPE constants
      */
     public int getMapType() {
-        if(internalNative != null) {
+        if (internalNative != null) {
             return internalNative.getMapType();
         } else if (browserBridge != null) {
             browserBridge.waitForReady();
             return browserBridge.bridge.callInt("getMapType");
-        }       
+        }
         return MAP_TYPE_NONE;
     }
-    
-    
-    
+
     /**
      * Position the map camera
+     *
      * @param crd the coordinate
      */
     public void setCameraPosition(Coord crd) {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
                 internalLightweightCmp.zoomTo(crd, internalLightweightCmp.getZoomLevel());
             } else {
                 browserBridge.waitForReady();
                 browserBridge.bridge.call(
-                        "setCameraPosition", 
+                        "setCameraPosition",
                         new Object[]{crd.getLatitude(), crd.getLongitude()}
                 );
             }
@@ -709,42 +748,44 @@ public class MapContainer extends Container {
         }
         internalNative.setPosition(crd.getLatitude(), crd.getLongitude());
     }
-    
+
     /**
      * Returns the position in the center of the camera
+     *
      * @return the position
      */
     public Coord getCameraPosition() {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
                 return internalLightweightCmp.getCenter();
             } else {
                 browserBridge.waitForReady();
                 String pos = browserBridge.bridge.callString("getCameraPosition");
                 try {
                     String latStr = pos.substring(0, pos.indexOf(" "));
-                    String lnStr = pos.substring(pos.indexOf(" ")+1);
+                    String lnStr = pos.substring(pos.indexOf(" ") + 1);
                     return new Coord(Double.parseDouble(latStr), Double.parseDouble(lnStr));
-                } catch (Exception ex) {
+                } catch (NumberFormatException ex) {
                     ex.printStackTrace();
                     return new Coord(0, 0);
                 }
-                
+
             }
 
         }
         return new Coord(internalNative.getLatitude(), internalNative.getLongitude());
     }
-    
+
     /**
      * Returns the lat/lon coordinate at the given x/y position
+     *
      * @param x the x position in component relative coordinate system
      * @param y the y position in component relative coordinate system
      * @return a lat/lon coordinate
      */
     public Coord getCoordAtPosition(int x, int y) {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
                 return internalLightweightCmp.getCoordFromPosition(x + getAbsoluteX(), y + getAbsoluteY());
             }
             browserBridge.waitForReady();
@@ -755,12 +796,12 @@ public class MapContainer extends Container {
             //if (res instanceof Double) {
             //    int i = 0;
             //}
-            String coord = (String)browserBridge.bridge.call("getCoordAtPosition", new Object[]{x, y});
+            String coord = (String) browserBridge.bridge.call("getCoordAtPosition", new Object[]{x, y});
             try {
                 String xStr = coord.substring(0, coord.indexOf(" "));
-                String yStr = coord.substring(coord.indexOf(" ")+1);
+                String yStr = coord.substring(coord.indexOf(" ") + 1);
                 return new Coord(Double.parseDouble(xStr), Double.parseDouble(yStr));
-            } catch (Exception ex) {
+            } catch (NumberFormatException ex) {
                 ex.printStackTrace();
             }
             return new Coord(0, 0);
@@ -768,42 +809,45 @@ public class MapContainer extends Container {
         internalNative.calcLatLongPosition(x, y);
         return new Coord(internalNative.getScreenLat(), internalNative.getScreenLon());
     }
-    
+
     /**
-     * Returns the screen position for the coordinate in component relative position
+     * Returns the screen position for the coordinate in component relative
+     * position
+     *
      * @param lat the latitude
      * @param lon the longitude
      * @return the x/y position in component relative position
      */
     public Point getScreenCoordinate(double lat, double lon) {
-        if(internalNative == null) {
-            if(internalLightweightCmp != null) {
-                Point p =  internalLightweightCmp.getPointFromCoord(new Coord(lat, lon));
+        if (internalNative == null) {
+            if (internalLightweightCmp != null) {
+                Point p = internalLightweightCmp.getPointFromCoord(new Coord(lat, lon));
                 p.setX(p.getX());
                 p.setY(p.getY());
                 return p;
             }
             browserBridge.waitForReady();
-            String coord = (String)browserBridge.bridge.call("getScreenCoord", new Object[]{lat, lon});
+            String coord = (String) browserBridge.bridge.call("getScreenCoord", new Object[]{lat, lon});
             try {
                 String xStr = coord.substring(0, coord.indexOf(" "));
-                String yStr = coord.substring(coord.indexOf(" ")+1);
+                String yStr = coord.substring(coord.indexOf(" ") + 1);
                 return new Point(
-                        (int)Double.parseDouble(xStr), 
-                        (int)Double.parseDouble(yStr)
+                        (int) Double.parseDouble(xStr),
+                        (int) Double.parseDouble(yStr)
                 );
-            } catch (Exception ex) {
+            } catch (NumberFormatException ex) {
                 ex.printStackTrace();
             }
-            
+
             return new Point(0, 0);
         }
         internalNative.calcScreenPosition(lat, lon);
         return new Point(internalNative.getScreenX(), internalNative.getScreenY());
     }
-    
+
     /**
      * Returns the location on the screen for the given coordinate
+     *
      * @param c the coordinate
      * @return the x/y position in component relative position
      */
@@ -813,65 +857,66 @@ public class MapContainer extends Container {
 
     static void fireMapChangeEvent(int mapId, final int zoom, final double lat, final double lon) {
         final MapContainer mc = instances.get(mapId);
-        if(mc != null) {
-            if(!Display.getInstance().isEdt()) {
+        if (mc != null) {
+            if (Display.getInstance().isEdt()) {
+                mc.fireMapListenerEvent(zoom, lat, lon);
+            } else {
                 Display.getInstance().callSerially(new Runnable() {
+                    @Override
                     public void run() {
                         mc.fireMapListenerEvent(zoom, lat, lon);
                     }
                 });
-                return;
             }
-            mc.fireMapListenerEvent(zoom, lat, lon);
         }
     }
-    
+
     /**
-     * Adds a listener to user tapping on a map location, this shouldn't fire for 
-     * dragging.
-     * 
+     * Adds a listener to user tapping on a map location, this shouldn't fire
+     * for dragging.
+     *
      * @param e the tap listener
      */
     public void addTapListener(ActionListener e) {
-        if(tapListener == null) {
+        if (tapListener == null) {
             tapListener = new EventDispatcher();
         }
         tapListener.addListener(e);
     }
-    
+
     /**
-     * Removes the listener to user tapping on a map location, this shouldn't fire for 
-     * dragging.
-     * 
+     * Removes the listener to user tapping on a map location, this shouldn't
+     * fire for dragging.
+     *
      * @param e the tap listener
      */
     public void removeTapListener(ActionListener e) {
-        if(tapListener == null) {
+        if (tapListener == null) {
             return;
         }
         tapListener.removeListener(e);
-        if(!tapListener.hasListeners()) {
+        if (!tapListener.hasListeners()) {
             tapListener = null;
         }
     }
-    
+
     static void fireTapEventStatic(int mapId, int x, int y) {
         final MapContainer mc = instances.get(mapId);
-        if(mc != null) {
+        if (mc != null) {
             mc.fireTapEvent(x, y);
         }
     }
-    
-    private void fireTapEvent(int x, int y) { 
-        if(tapListener != null) {
+
+    private void fireTapEvent(int x, int y) {
+        if (tapListener != null) {
             tapListener.fireActionEvent(new ActionEvent(this, x, y));
         }
     }
-    
+
     /**
-     * Adds a listener to user long pressing on a map location, this shouldn't fire for 
-     * dragging.
-     * 
+     * Adds a listener to user long pressing on a map location, this shouldn't
+     * fire for dragging.
+     *
      * @param e the tap listener
      */
     public void addLongPressListener(ActionListener e) {
@@ -882,9 +927,9 @@ public class MapContainer extends Container {
     }
 
     /**
-     * Removes the long press listener to user tapping on a map location, this shouldn't fire for 
-     * dragging.
-     * 
+     * Removes the long press listener to user tapping on a map location, this
+     * shouldn't fire for dragging.
+     *
      * @param e the tap listener
      */
     public void removeLongPressListener(ActionListener e) {
@@ -905,27 +950,29 @@ public class MapContainer extends Container {
             longPressListener.fireActionEvent(new ActionEvent(this, x, y));
         }
     }
-    
+
     void fireMapListenerEvent(int zoom, double lat, double lon) {
         // assuming always EDT
-        if(listeners != null) {
+        if (listeners != null) {
             Coord c = new Coord(lat, lon);
-            for(MapListener l : listeners) {
+            for (MapListener l : listeners) {
                 l.mapPositionUpdated(this, zoom, c);
             }
         }
     }
-    
+
     /**
-     * Adds a listener to map panning/zooming Important: events are only sent when the native map is in initialized state
+     * Adds a listener to map panning/zooming Important: events are only sent
+     * when the native map is in initialized state
+     *
      * @param listener the listener callback
      */
     public void addMapListener(MapListener listener) {
-        if(internalNative == null && internalLightweightCmp != null) {
+        if (internalNative == null && internalLightweightCmp != null) {
             internalLightweightCmp.addMapListener(listener);
             return;
         }
-        if(listeners == null) {
+        if (listeners == null) {
             listeners = new ArrayList<MapListener>();
         }
         listeners.add(listener);
@@ -933,14 +980,15 @@ public class MapContainer extends Container {
 
     /**
      * Removes the map listener callback
+     *
      * @param listener the listener
      */
     public void removeMapListener(MapListener listener) {
-        if(internalNative == null && internalLightweightCmp != null) {
+        if (internalNative == null && internalLightweightCmp != null) {
             internalLightweightCmp.removeMapListener(listener);
             return;
         }
-        if(listeners == null) {
+        if (listeners == null) {
             return;
         }
         listeners.remove(listener);
@@ -949,6 +997,7 @@ public class MapContainer extends Container {
     /**
      * Show my location is a feature of the native maps only that allows marking
      * a users location on the map with a circle
+     *
      * @return the showMyLocation
      */
     public boolean isShowMyLocation() {
@@ -958,11 +1007,12 @@ public class MapContainer extends Container {
     /**
      * Show my location is a feature of the native maps only that allows marking
      * a users location on the map with a circle
+     *
      * @param showMyLocation the showMyLocation to set
      */
     public void setShowMyLocation(boolean showMyLocation) {
         this.showMyLocation = showMyLocation;
-        if(isNativeMaps()) {
+        if (isNativeMaps()) {
             internalNative.setShowMyLocation(showMyLocation);
         }
     }
@@ -979,15 +1029,286 @@ public class MapContainer extends Container {
      */
     public final void setRotateGestureEnabled(boolean rotateGestureEnabled) {
         this.rotateGestureEnabled = rotateGestureEnabled;
-        if(isNativeMaps()) {
+        if (isNativeMaps()) {
             internalNative.setRotateGestureEnabled(rotateGestureEnabled);
         }
     }
-    
+
+//Adapt for with layers
+    /**
+     * Adds a layer to the map
+     *
+     * @param layer to add
+     */
+    public void addLayer(Layer layer) {
+        addLayer(layer, getMinZoom(), getMaxZoom());
+    }
+
+    /**
+     * Adds a layer to the map
+     *
+     * @param layer to add
+     * @param minZoomLevel min zoom level of this Layer
+     * @param maxZoomLevel max zoom level of this Layer
+     */
+    public void addLayer(Layer layer, int minZoomLevel, int maxZoomLevel) {
+        layerAdaptor.addLayer(layer, minZoomLevel, maxZoomLevel);
+    }
+
+    /**
+     * Removes a Layer from the map
+     *
+     * @param layer to remove
+     */
+    public void removeLayer(Layer layer) {
+        layerAdaptor.removeLayer(layer);
+    }
+
+    /**
+     * Removes all CN1 custom layers from the map
+     */
+    public void removeAllLayers() {
+        layerAdaptor._layers.removeAll(layerAdaptor._layers);
+        layerAdaptor.repaint();
+    }
+
+    /**
+     * @return number of layers in this Map Container
+     */
+    public int getLayersConut() {
+        return layerAdaptor._layers.size();
+    }
+
+    /**
+     * Returns Layer at index
+     *
+     * @param index the index of the layer
+     * @return Layer
+     * @throws ArrayIndexOutOfBoundsException - if the index is out of range
+     * (index < 0 || index >= size())
+     */
+    public Layer getLayerAt(int index) {
+        Layer l = layerAdaptor._layers.get(index).layer;
+        return l;
+    }
+
+
+    /**
+     * Adaptor to paint {@code Layer} on native Map Container
+     */
+    static class LayerAdaptor {
+    	
+    	/**
+		 * Directly ported from MapComponent, to store Layer with max and min zoom
+		 * levels
+		 */
+		class LayerWithZoomLevels {
+		
+		    public Layer layer;
+		    public int minZoomLevel;
+		    public int maxZoomLevel;
+		
+		    public LayerWithZoomLevels(Layer l, int min, int max) {
+		        layer = l;
+		        minZoomLevel = min;
+		        maxZoomLevel = max;
+		    }
+		    
+		    /**
+		     * 
+		     * @param l Another layer
+		     * @return {@code true} if layer contained is the same as l
+		     */
+		    public boolean isSameLayer (Layer l) {
+		    	return layer == l || layer.equals(l);
+		    }
+		    
+		    @Override
+		    public boolean equals(Object another) {
+		    	if (another instanceof LayerWithZoomLevels) {
+		    		LayerWithZoomLevels obj = (LayerWithZoomLevels) another;
+		    		return 
+		    				layer.equals(obj.layer) && 
+		    				(minZoomLevel == obj.minZoomLevel) && 
+		    				(maxZoomLevel == obj.maxZoomLevel);
+		    	} 
+		    	return false;
+		    }
+		}
+
+		/**
+    	 * A reference to MapContainer.this
+    	 */
+    	private MapContainer mc;
+    	
+    	/**
+    	 * Projection used to draw the map
+    	 */
+        private static final Projection wgs = new Mercator();
+        
+        /**
+         * Hold the reference to layers
+         */
+        List<LayerWithZoomLevels> _layers;
+        
+        /**
+         * Holds the layers
+         */
+        Component layersDraw;
+    	
+        /**
+         * Repaint all layers
+         */
+        void repaint() {
+            layersDraw.repaint();
+        }
+        
+        LayerAdaptor(final MapContainer mc) {
+            _layers = new ArrayList<LayerWithZoomLevels>();
+            
+            /**
+             * This component will draw all layers 
+             */
+            layersDraw = new Container() {
+            	
+            	/**
+            	 * Indicate if the screen tile is updating. If so the 
+            	 * program should not try to call for another screenTile()
+            	 */
+            	private boolean isGettingScreenTile;
+            	
+            	private Tile tempScreenTile;
+            	private float tempZoom = 10;
+            	
+                @Override
+                public void paint(final Graphics g) {
+                	if (isGettingScreenTile) {
+                		tryPaint(g);
+                	} else {
+                		isGettingScreenTile = true;
+                		//delay the call after painting
+                            Display.getInstance().callSerially(new Runnable() {
+                                public void run() {
+                                    tempZoom = mc.getZoom();
+                                    tempScreenTile = screenTile();
+                                    paintLayers(g, tempScreenTile, tempZoom);
+                                }
+                            });
+                                
+                		tryPaint(g);
+                	}
+                }
+                
+                /**
+                 * Try to paint the layers if a past screenTile is stored.
+                 * @param g
+                 */
+                private void tryPaint(Graphics g) {
+                	if (!(tempScreenTile == null)) { //Screen tile not updated yet
+            			//Use old screen tile to paint
+                		
+                		//Handles the Graphics
+                    	int translateX = getAbsoluteX() - g.getTranslateX(), 
+                    			translateY = getAbsoluteY() - g.getTranslateY();
+                    	g.translate(translateX, translateY); //Set translation
+                    	int[] clip = g.getClip(); //Clip the graphics
+                    	g.setClip(0, 0, getWidth(), getHeight());
+                    	
+                    	paintLayers(g, tempScreenTile, tempZoom);
+            			
+            			g.setClip(clip); //Restore the original clip
+                        g.translate(-translateX, -translateY); //Reset translation
+            		} //else cannot paint...
+                }
+                
+                private void paintLayers(Graphics g, Tile screenTile, float zoom) {
+                    for (LayerWithZoomLevels layer : _layers) {
+                        if (zoom >= layer.minZoomLevel && zoom <= layer.maxZoomLevel) {
+                            layer.layer.paint(g, screenTile);
+                        }
+                    }
+                }
+
+                /**
+                 * 
+                 * @return Screen tile
+                 * @deprecated The call to get screenTile may trigger another 
+                 * repaint, sometimes causing StackOverflowException or 
+                 * multiple repaint()...
+                 */
+                @Deprecated
+                private Tile screenTile() {
+                    Dimension d = new Dimension(getWidth(), getHeight());
+                    //This call will invoke native calls, potentially triggering 
+                    //another repaint (When the last call was still blocked by 
+                    //the native method! This call is minimized by setting a 
+                    //flag (isGettingScreenTile)
+                    BoundingBox bx = mc.getBoundingBox(); 
+                    
+                    //Finished getting the screen tile
+                    isGettingScreenTile = false;
+                    return new Tile(d, wgs.toWGS84(bx), null);
+                }
+                
+            };
+            
+        }
+
+        /**
+         * Add a layer
+         * @param layer
+         * @param minZoomLevel
+         * @param maxZoomLevel
+         */
+        void addLayer(Layer layer, int minZoomLevel, int maxZoomLevel) {
+            _layers.add(new LayerWithZoomLevels(layer, minZoomLevel, maxZoomLevel));
+            if (layer instanceof PointsLayer) {
+                /*mc.addPointerReleasedListener((evt) -> {
+            		BoundingBox bb = mc.getBoundingBox();
+            		((PointsLayer) layer).fireActionEvent(bb);
+            	}); */
+            }
+        }
+        
+        /**
+         * Remove a layer
+         * @param layer
+         */
+        void removeLayer(Layer layer) {
+            for (LayerWithZoomLevels lz : _layers) {
+                if (lz.isSameLayer(layer)) {
+                    _layers.remove(lz);
+                }
+            }
+            repaint();
+        }
+    }
+
+    /**
+     * Removes all the layers from the map
+     */
+    public void clearMapLayers() {
+        if (internalNative != null) {
+            internalNative.removeAllMarkers();
+            markers.clear();
+        } else {
+            if (internalLightweightCmp != null) {
+                internalLightweightCmp.removeAllLayers();
+                points = null;
+            } else {
+                browserBridge.waitForReady();
+                browserBridge.bridge.call("removeAllMarkers");
+                markers.clear();
+            }
+        }
+        removeAllLayers();
+    }
+
     /**
      * Object on the map
      */
     public static class MapObject {
+
         long mapKey;
         ActionListener callback;
         PointLayer point;
